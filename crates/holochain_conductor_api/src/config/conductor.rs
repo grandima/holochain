@@ -94,6 +94,13 @@ pub struct ConductorConfig {
 
     /// The amount of time, in seconds, to elapse before a request times out.
     ///
+    /// This timeout controls the overall request-response cycle in the Holochain P2P layer.
+    /// It also automatically configures the underlying transport timeouts:
+    /// - tx5 timeout is set to `request_timeout_s/2` (for individual transport requests)
+    /// - webrtc connect timeout is set to `(request_timeout_s * 3)/8` (for WebRTC connection establishment)
+    ///
+    /// Automatically set values will override any manual configuration in the network advanced settings.
+    ///
     /// Defaults to 60 seconds.
     #[serde(default = "default_request_timeout_s")]
     pub request_timeout_s: u64,
@@ -391,7 +398,11 @@ impl NetworkConfig {
     /// Convert the network config to a K2 config object.
     ///
     /// Values that are set directly on the network config are merged into the [`NetworkConfig::advanced`] field.
-    pub fn to_k2_config(&self) -> ConductorConfigResult<serde_json::Value> {
+    ///
+    /// # Arguments
+    /// * `request_timeout_s` - The request timeout in seconds, used to automatically configure
+    ///   tx5 timeout to `request_timeout_s/2` and webrtc connect timeout to `(request_timeout_s * 3)/8`.
+    pub fn to_k2_config(&self, request_timeout_s: u64) -> ConductorConfigResult<serde_json::Value> {
         let mut working = self
             .advanced
             .clone()
@@ -410,6 +421,26 @@ impl NetworkConfig {
                 "tx5Transport",
                 "serverUrl",
                 serde_json::Value::String(self.signal_url.as_str().into()),
+            )?;
+
+            // Automatically set tx5 timeout to request_timeout_s/2
+            // This timeout is for the entire request-response cycle
+            let tx5_timeout_s = request_timeout_s / 2;
+            Self::insert_module_config(
+                module_config,
+                "tx5Transport",
+                "timeoutS",
+                serde_json::Value::Number(serde_json::Number::from(tx5_timeout_s)),
+            )?;
+
+            // Automatically set webrtc connect timeout to (request_timeout_s * 3)/8
+            // This timeout is for WebRTC connection establishment before falling back to sbd relay
+            let webrtc_connect_timeout_s = (request_timeout_s * 3) / 8;
+            Self::insert_module_config(
+                module_config,
+                "tx5Transport",
+                "webrtcConnectTimeoutS",
+                serde_json::Value::Number(serde_json::Number::from(webrtc_connect_timeout_s)),
             )?;
 
             if let Some(webrtc_config) = &self.webrtc_config {
@@ -837,7 +868,7 @@ mod tests {
     #[test]
     fn default_network_config_accepted_by_k2() {
         let network_config = NetworkConfig::default();
-        let k2_config = network_config.to_k2_config().unwrap();
+        let k2_config = network_config.to_k2_config(60).unwrap();
 
         let builder = kitsune2_core::default_test_builder()
             .with_default_config()
@@ -863,7 +894,7 @@ mod tests {
             ..Default::default()
         };
 
-        let k2_config = network_config.to_k2_config().unwrap();
+        let k2_config = network_config.to_k2_config(60).unwrap();
 
         let builder = kitsune2_core::default_test_builder()
             .with_default_config()
@@ -879,7 +910,8 @@ mod tests {
                 },
                 "tx5Transport": {
                     "serverUrl": "wss://dev-test-bootstrap2.holochain.org/",
-                    "timeoutS": "10",
+                    "timeoutS": 30,
+                    "webrtcConnectTimeoutS": 22,
                 },
                 "coreSpace": {
                     "reSignFreqMs": "1000",
@@ -902,7 +934,7 @@ mod tests {
             ..Default::default()
         };
 
-        let k2_config = network_config.to_k2_config().unwrap();
+        let k2_config = network_config.to_k2_config(60).unwrap();
 
         let builder = kitsune2_core::default_test_builder()
             .with_default_config()
@@ -918,6 +950,8 @@ mod tests {
                 },
                 "tx5Transport": {
                     "serverUrl": "wss://dev-test-bootstrap2.holochain.org/",
+                    "timeoutS": 30,
+                    "webrtcConnectTimeoutS": 22,
                 },
             })
         )
@@ -931,7 +965,7 @@ mod tests {
             .with_gossip_initiate_jitter_ms(50)
             .with_gossip_min_initiate_interval_ms(300);
 
-        let k2_config = network_config.to_k2_config().unwrap();
+        let k2_config = network_config.to_k2_config(60).unwrap();
 
         let builder = kitsune2_core::default_test_builder()
             .with_default_config()
@@ -947,6 +981,8 @@ mod tests {
                 },
                 "tx5Transport": {
                     "serverUrl": "wss://dev-test-bootstrap2.holochain.org/",
+                    "timeoutS": 30,
+                    "webrtcConnectTimeoutS": 22,
                 },
                 "k2Gossip": {
                     "roundTimeoutMs": 100,
@@ -956,5 +992,44 @@ mod tests {
                 }
             })
         )
+    }
+
+    #[test]
+    fn request_timeout_configures_tx5_timeouts() {
+        let network_config = NetworkConfig::default();
+
+        // Test with default 60 second timeout
+        let k2_config = network_config.to_k2_config(60).unwrap();
+        let tx5_transport = k2_config.get("tx5Transport").unwrap();
+
+        assert_eq!(tx5_transport.get("timeoutS").unwrap(), 30); // 60/2
+        assert_eq!(tx5_transport.get("webrtcConnectTimeoutS").unwrap(), 22); // (60*3)/8 = 22.5 -> 22
+
+        // Test with custom 100 second timeout
+        let k2_config = network_config.to_k2_config(100).unwrap();
+        let tx5_transport = k2_config.get("tx5Transport").unwrap();
+
+        assert_eq!(tx5_transport.get("timeoutS").unwrap(), 50); // 100/2
+        assert_eq!(tx5_transport.get("webrtcConnectTimeoutS").unwrap(), 37); // (100*3)/8 = 37.5 -> 37
+    }
+
+    #[test]
+    fn automatic_timeouts_override_manual_configuration() {
+        let network_config = NetworkConfig {
+            advanced: Some(serde_json::json!({
+                "tx5Transport": {
+                    "timeoutS": "10",
+                    "webrtcConnectTimeoutS": "5"
+                }
+            })),
+            ..Default::default()
+        };
+
+        let k2_config = network_config.to_k2_config(60).unwrap();
+        let tx5_transport = k2_config.get("tx5Transport").unwrap();
+
+        // Automatic values should override manual configuration
+        assert_eq!(tx5_transport.get("timeoutS").unwrap(), 30); // automatic, not 10
+        assert_eq!(tx5_transport.get("webrtcConnectTimeoutS").unwrap(), 22); // automatic, not 5
     }
 }

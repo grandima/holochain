@@ -236,7 +236,7 @@ impl ConductorBuilder {
                 Box::pin(async move { conductor_db })
             }),
             target_arc_factor: config.network.target_arc_factor,
-            network_config: Some(config.network.to_k2_config()?),
+            network_config: Some(config.network.to_k2_config(config.request_timeout_s)?),
             report,
             compat,
             request_timeout: std::time::Duration::from_secs(config.request_timeout_s),
@@ -454,7 +454,7 @@ impl ConductorBuilder {
                 Box::pin(async move { conductor_db })
             }),
             target_arc_factor: config.network.target_arc_factor,
-            network_config: Some(config.network.to_k2_config()?),
+            network_config: Some(config.network.to_k2_config(config.request_timeout_s)?),
             report,
             compat,
             request_timeout: std::time::Duration::from_secs(config.request_timeout_s),
